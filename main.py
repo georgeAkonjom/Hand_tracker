@@ -4,28 +4,36 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-from gesture_detector import GestureDetector
+from coordinate_translator import CoordinateTranslator
+from boolean_gesture_detector import BooleanGestureDetector
 
-mp_drawing = mp.tasks.vision.drawing_utils
-mp_drawing_styles = mp.tasks.vision.drawing_styles
-mp_hands = mp.tasks.vision.HandLandmarksConnections
+# Hand tracking utilities (using the more stable tasks API)
+try:
+    mp_drawing = mp.tasks.vision.drawing_utils
+    mp_drawing_styles = mp.tasks.vision.drawing_styles
+    mp_hands = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
+except AttributeError:
+    # Fallback to older drawing utils if necessary
+    import mediapipe.python.solutions.drawing_utils as mp_drawing
+    import mediapipe.python.solutions.drawing_styles as mp_drawing_styles
+    from mediapipe.python.solutions.hands import HAND_CONNECTIONS as mp_hands
 
-base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
-options = vision.HandLandmarkerOptions(
-    base_options=base_options,
+# --- Hand Detector Setup ---
+hand_options = vision.HandLandmarkerOptions(
+    base_options=python.BaseOptions(model_asset_path='models_landmarkers/hand_landmarker.task'),
     running_mode=vision.RunningMode.IMAGE,
     num_hands=2, 
     min_hand_detection_confidence=0.5,
     min_hand_presence_confidence=0.5,
 )
+hand_detector = vision.HandLandmarker.create_from_options(hand_options)
 
-detector = vision.HandLandmarker.create_from_options(options)
-
-# Initialize the gesture detector imported from gesture_detector.py
-gesture_detector = GestureDetector()
+# Initialize utilities
+translator = CoordinateTranslator()
+bool_detector = BooleanGestureDetector()
 
 cap = cv2.VideoCapture(0)
-print("Watching for file changes... Press Ctrl+C in terminal to stop entirely.")
+print("Watching for hand motion... Press 'q' to quit.")
 
 try:
     while cap.isOpened():
@@ -33,37 +41,40 @@ try:
         if not success:
             continue
             
-        # frame = cv2.flip(frame, 1)
+        # Flip for natural mirrored view
+        frame = cv2.flip(frame, 1)
+        
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         
-        detection_result = detector.detect(mp_image)
-        
-        if detection_result.hand_landmarks:
-            for idx in range(len(detection_result.hand_landmarks)):
-                hand_landmarks = detection_result.hand_landmarks[idx]
-                raw_handedness = detection_result.handedness[idx][0].category_name
-                
+        # 1. Process Hands
+        hand_result = hand_detector.detect(mp_image)
+        if hand_result.hand_landmarks:
+            for idx, hand_landmarks in enumerate(hand_result.hand_landmarks):
+                raw_handedness = hand_result.handedness[idx][0].category_name
                 handedness = "Right" if raw_handedness == "Left" else "Left"
-                
-                # Use your external class
-                gesture_name, finger_count = gesture_detector.recognize(hand_landmarks, handedness)
-                
-                display_text = f"{handedness}: {finger_count} Fingers | {gesture_name}"
-                text_y_position = 50 + (idx * 40) 
-                
-                cv2.putText(
-                    frame, display_text, (20, text_y_position), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2
-                )
-                
-                mp_drawing.draw_landmarks(
-                    frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style(),
-                    mp_drawing_styles.get_default_hand_connections_style()
-                )
 
-        cv2.imshow("Gesture Tracker", frame)
+                # Get geometry & gestures
+                hand_data = translator.get_structured_data(hand_landmarks, handedness)
+                gesture_name, _, facing = bool_detector.detect_gesture(hand_landmarks, handedness)
+                
+                # Display Results
+                text_y = 50 + (idx * 80)
+                wrist = hand_data['landmarks'][0]
+                
+                cv2.putText(frame, f"{handedness} {facing}: x={wrist['x']:.2f}, y={wrist['y']:.2f}", 
+                            (20, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, f"Gesture: {gesture_name}", 
+                            (20, text_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                
+                if mp_drawing:
+                    mp_drawing.draw_landmarks(
+                        frame, hand_landmarks, mp_hands,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style()
+                    )
+
+        cv2.imshow("Hand Tracker", frame)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
