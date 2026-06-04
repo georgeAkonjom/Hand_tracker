@@ -1,85 +1,94 @@
-# main.py
 import cv2
 import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+import time
+import argparse
+import sys
 
-from coordinate_translator import CoordinateTranslator
-from boolean_gesture_detector import BooleanGestureDetector
+from detectors.hand.hand_detector import HandDetectorWrapper
+from detectors.face.face_detector import FaceDetectorWrapper
+from detectors.pose.pose_detector import PoseDetectorWrapper
 
-# Hand tracking utilities (using the more stable tasks API)
-try:
-    mp_drawing = mp.tasks.vision.drawing_utils
-    mp_drawing_styles = mp.tasks.vision.drawing_styles
-    mp_hands = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
-except AttributeError:
-    # Fallback to older drawing utils if necessary
-    import mediapipe.python.solutions.drawing_utils as mp_drawing
-    import mediapipe.python.solutions.drawing_styles as mp_drawing_styles
-    from mediapipe.python.solutions.hands import HAND_CONNECTIONS as mp_hands
+def main():
+    parser = argparse.ArgumentParser(description="Multi-Module Hand, Face, and Pose Tracker")
+    parser.add_argument('--hand', action='store_true', help='Enable Hand Tracking')
+    parser.add_argument('--face', action='store_true', help='Enable Face Tracking')
+    parser.add_argument('--pose', action='store_true', help='Enable Pose Tracking')
+    parser.add_argument('--all', action='store_true', help='Enable all modules')
+    parser.add_argument('--url', type=str, help='IP Webcam URL (e.g., http://192.168.0.209:8080/video)')
+    
+    args = parser.parse_args()
 
-# --- Hand Detector Setup ---
-hand_options = vision.HandLandmarkerOptions(
-    base_options=python.BaseOptions(model_asset_path='models_landmarkers/hand_landmarker.task'),
-    running_mode=vision.RunningMode.IMAGE,
-    num_hands=2, 
-    min_hand_detection_confidence=0.5,
-    min_hand_presence_confidence=0.5,
-)
-hand_detector = vision.HandLandmarker.create_from_options(hand_options)
+    # If no flags are provided, default to --hand
+    if not (args.hand or args.face or args.pose or args.all):
+        print("No module specified. Defaulting to Hand Tracking.")
+        args.hand = True
 
-# Initialize utilities
-translator = CoordinateTranslator()
-bool_detector = BooleanGestureDetector()
+    active_detectors = []
+    
+    if args.hand or args.all:
+        active_detectors.append(HandDetectorWrapper())
+    if args.face or args.all:
+        active_detectors.append(FaceDetectorWrapper())
+    if args.pose or args.all:
+        active_detectors.append(PoseDetectorWrapper())
 
-cap = cv2.VideoCapture(0)
-print("Watching for hand motion... Press 'q' to quit.")
+    # Initialize Video Source
+    video_source = args.url if args.url else 0
+    
+    # If the video source is a digit string, cast it to an integer device index
+    if isinstance(video_source, str) and video_source.isdigit():
+        video_source = int(video_source)
+        
+    # Common fix: IP Webcam usually requires /video suffix for the raw stream
+    elif isinstance(video_source, str) and video_source.startswith("http") and not video_source.endswith("/video"):
+        if not video_source.endswith("/"):
+            video_source += "/"
+        video_source += "video"
+        
+    cap = cv2.VideoCapture(video_source)
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open video source {video_source}")
+        sys.exit(1)
+        
+    # Minimize buffering latency for real-time camera feeds
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+    print(f"Streaming from: {'Local Camera' if video_source == 0 else video_source}")
+    print("Press 'q' to quit.")
 
-try:
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            continue
+    try:
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                continue
+                
+            # Flip for natural mirrored view
+            frame = cv2.flip(frame, 1)
             
-        # Flip for natural mirrored view
-        frame = cv2.flip(frame, 1)
-        
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        
-        # 1. Process Hands
-        hand_result = hand_detector.detect(mp_image)
-        if hand_result.hand_landmarks:
-            for idx, hand_landmarks in enumerate(hand_result.hand_landmarks):
-                raw_handedness = hand_result.handedness[idx][0].category_name
-                handedness = "Right" if raw_handedness == "Left" else "Left"
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            
+            # 1. Trigger Asynchronous Inference for all active detectors
+            timestamp_ms = int(time.time() * 1000)
+            for detector in active_detectors:
+                detector.detect_async(mp_image, timestamp_ms)
+            
+            # 2. Draw results from all active detectors
+            for detector in active_detectors:
+                detector.draw(frame)
 
-                # Get geometry & gestures
-                hand_data = translator.get_structured_data(hand_landmarks, handedness)
-                gesture_name, _, facing = bool_detector.detect_gesture(hand_landmarks, handedness)
-                
-                # Display Results
-                text_y = 50 + (idx * 80)
-                wrist = hand_data['landmarks'][0]
-                
-                cv2.putText(frame, f"{handedness} {facing}: x={wrist['x']:.2f}, y={wrist['y']:.2f}", 
-                            (20, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(frame, f"Gesture: {gesture_name}", 
-                            (20, text_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                
-                if mp_drawing:
-                    mp_drawing.draw_landmarks(
-                        frame, hand_landmarks, mp_hands,
-                        mp_drawing_styles.get_default_hand_landmarks_style(),
-                        mp_drawing_styles.get_default_hand_connections_style()
-                    )
+            cv2.imshow("Multi-Module Tracker", frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-        cv2.imshow("Hand Tracker", frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    finally:
+        print("\nCleaning up...")
+        for detector in active_detectors:
+            detector.close()
+        cap.release()
+        cv2.destroyAllWindows()
 
-finally:
-    print("\nReleasing camera...")
-    cap.release()
-    cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()

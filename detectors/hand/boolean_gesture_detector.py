@@ -1,13 +1,16 @@
 # boolean_gesture_detector.py
 
+import math
+
 class BooleanGestureDetector:
     def __init__(self):
-        # Format: (Tip_Index, Knuckle_Index)
+        # Format: (Tip_Index, PIP_Index, MCP_Index)
+        # Using PIP as the reference for 'up' vs 'down' via distance from wrist
         self.finger_joints = {
-            'index': (8, 6),
-            'middle': (12, 10),
-            'ring': (16, 14),
-            'pinky': (20, 18)
+            'index': (8, 6, 5),
+            'middle': (12, 10, 9),
+            'ring': (16, 14, 13),
+            'pinky': (20, 18, 17)
         }
         
         # Tuple format: (Thumb, Index, Middle, Ring, Pinky) representing up (True) or down (False)
@@ -44,14 +47,21 @@ class BooleanGestureDetector:
             (False, False, False, True, True): "Ring & Pinky"
         }
 
+    def _get_distance(self, p1, p2):
+        """Calculates Euclidean distance between two landmarks."""
+        return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
     def get_finger_states(self, hand_landmarks):
-        """Returns boolean values for the 4 main fingers (Y-axis logic)."""
+        """Returns boolean values for the 4 main fingers (Distance-based logic)."""
         states = {}
+        wrist = hand_landmarks[0]
+        
         for finger_name, joints in self.finger_joints.items():
-            tip_idx = joints[0]
-            knuckle_idx = joints[1]
-            # Finger is considered 'up' if the tip is higher (lower y-coordinate) than the knuckle
-            states[finger_name] = hand_landmarks[tip_idx].y < hand_landmarks[knuckle_idx].y
+            tip = hand_landmarks[joints[0]]
+            pip = hand_landmarks[joints[1]]
+            
+            # Rotationally invariant: if Tip is further from Wrist than the PIP joint is
+            states[finger_name] = self._get_distance(wrist, tip) > self._get_distance(wrist, pip)
         return states
 
     def is_palm_facing(self, hand_landmarks, handedness):
@@ -69,19 +79,36 @@ class BooleanGestureDetector:
             return index_mcp.x < pinky_mcp.x
 
     def get_thumb_state(self, hand_landmarks, handedness):
-        """Returns boolean value for the thumb (X-axis logic), adjusted for palm facing."""
+        """Returns boolean value for the thumb (Distance-based logic)."""
+        # Distance from thumb tip to pinky MCP is a robust indicator of extension
+        # across all rotations.
         thumb_tip = hand_landmarks[4]
-        thumb_base = hand_landmarks[2]
-        is_palm = self.is_palm_facing(hand_landmarks, handedness)
+        thumb_ip = hand_landmarks[3]
+        pinky_mcp = hand_landmarks[17]
         
-        # Base logic: Is the thumb extended 'outwards' from the palm?
-        if handedness == "Right":
-            state = thumb_tip.x > thumb_base.x
-        else:
-            state = thumb_tip.x < thumb_base.x
-            
-        # If the back of the hand is facing, the X-order of thumb-out vs thumb-in is reversed
-        return state if is_palm else not state
+        return self._get_distance(thumb_tip, pinky_mcp) > self._get_distance(thumb_ip, pinky_mcp)
+
+    def detect_gesture(self, hand_landmarks, handedness):
+        """Evaluates all 5 fingers and returns the mapped gesture name, state tuple, and facing."""
+        is_palm = self.is_palm_facing(hand_landmarks, handedness)
+        states = self.get_finger_states(hand_landmarks)
+        
+        # Thumb state now respects if the hand is flipped
+        thumb_state = self.get_thumb_state(hand_landmarks, handedness)
+        
+        state_tuple = (
+            thumb_state,
+            states['index'],
+            states['middle'],
+            states['ring'],
+            states['pinky']
+        )
+        
+        gesture_name = self.gesture_map.get(state_tuple, "Unknown Gesture")
+        facing = "Palm" if is_palm else "Back"
+        return gesture_name, state_tuple, facing
+
+
 
     def detect_gesture(self, hand_landmarks, handedness):
         """Evaluates all 5 fingers and returns the mapped gesture name, state tuple, and facing."""
